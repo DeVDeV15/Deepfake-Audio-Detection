@@ -1,100 +1,88 @@
+import os
 import torch
 import torchaudio
 from torch.utils.data import Dataset
 
-class SpoofDiarizationDataset(Dataset):
+class SpoofDataset(Dataset):
     """
-    Slices raw waveforms into overlapping temporal frames for continuous diarization.
-    Applies active artifact amplification to expose low-frequency synthetic anomalies.
-    Handles short-file padding and label alignment defensively.
+    Dataset loader for ASVspoof 2019 LA and standardized audio deepfake formats.
+    Loads raw 16kHz mono audio, applying fixed-length padding or cropping (e.g., 4 seconds = 64,000 samples).
+    Extracts utterance-level ground-truth labels (0.0 = bonafide / real, 1.0 = spoof / fake).
     """
-    def __init__(self, audio_paths, labels=None, window_ms=400, hop_ms=20, sr=16000):
-        """
-        Args:
-            audio_paths (list): List of strings containing paths to audio files (.flac or .wav).
-            labels (list, optional): List of frame-level binary masks/arrays.
-            window_ms (int): Sliding window size in milliseconds.
-            hop_ms (int): Step size/hop length in milliseconds.
-            sr (int): Target sampling rate for processing.
-        """
+    def __init__(self, audio_paths, labels, target_samples=64000, sr=16000):
         self.audio_paths = audio_paths
-        self.labels = labels 
+        self.labels = labels
+        self.target_samples = target_samples
         self.sr = sr
-        self.window_size = int((window_ms / 1000) * sr)
-        self.hop_length = int((hop_ms / 1000) * sr)
-
-    def active_artifact_amplification(self, waveform):
-        """
-        Inverts speech enhancement logic to isolate and amplify low-frequency 
-        generative errors, preventing the network from utilizing noise shortcuts.
-        """
-        low_band = torchaudio.functional.lowpass_biquad(waveform, self.sr, cutoff_freq=3000)
-        amplified_waveform = waveform + (1.5 * low_band) 
-        return amplified_waveform
 
     def __len__(self):
         return len(self.audio_paths)
 
     def __getitem__(self, idx):
-        waveform, sr = torchaudio.load(self.audio_paths[idx])
+        path = self.audio_paths[idx]
+        waveform, original_sr = torchaudio.load(path)
         
-        # Ensure single channel (mono) tracking
+        # Convert multi-channel / stereo to mono
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
             
-        # Resample on the fly if original file deviates from target rate
-        if sr != self.sr:
-            waveform = torchaudio.functional.resample(waveform, sr, self.sr)
+        # Resample if sample rate does not match target (16 kHz)
+        if original_sr != self.sr:
+            resampler = torchaudio.transforms.Resample(orig_freq=original_sr, new_freq=self.sr)
+            waveform = resampler(waveform)
             
-        # Pad ultra-short files to avoid unfold errors
-        if waveform.shape[1] < self.window_size:
-            pad_amount = self.window_size - waveform.shape[1]
+        waveform = waveform.squeeze(0)
+        num_samples = waveform.shape[0]
+        
+        # Enforce exact length via padding or cropping
+        if num_samples < self.target_samples:
+            pad_amount = self.target_samples - num_samples
             waveform = torch.nn.functional.pad(waveform, (0, pad_amount))
-            
-        # 1. Magnify structural deepfake defects
-        waveform = self.active_artifact_amplification(waveform)
-        
-        # 2. Slice long waveform into sequential chunks [num_frames, window_size]
-        frames = waveform.unfold(1, self.window_size, self.hop_length).squeeze(0)
-        num_frames = frames.shape[0]
-        
-        # 3. Label Alignment Guard: Broadcasts the protocol label across all generated frames
-        if self.labels is not None:
-            label = self.labels[idx]
-            if not isinstance(label, torch.Tensor):
-                label = torch.tensor(label)
-                
-            if label.shape[0] < num_frames:
-                padding_val = label[-1] if label.numel() > 0 else 0
-                pad = torch.full((num_frames - label.shape[0],), padding_val, dtype=label.dtype)
-                label = torch.cat([label, pad])
-            else:
-                label = label[:num_frames]
         else:
-            label = torch.full((num_frames,), -1)
+            waveform = waveform[:self.target_samples]
             
-        return frames, label
+        label = torch.tensor(self.labels[idx], dtype=torch.float32)
+        return waveform, label
 
-def collate_diarization_batch(batch):
+
+def parse_asvspoof_protocol(protocol_path, audio_dir):
     """
-    DYNAMIC COLLATION ENHANCEMENT:
-    Pads variable frame counts within a batch to matching lengths on the fly.
-    Pads features with 0 and masks with -1 so train.py drops them seamlessly.
+    Parses ASVspoof 2019 LA protocol text files.
+    Returns lists of file paths and float labels (0.0 for bonafide, 1.0 for spoof).
     """
-    batch_frames = [item[0] for item in batch]
-    batch_labels = [item[1] for item in batch]
+    audio_paths = []
+    labels = []
     
-    # Identify the maximum frame length inside this specific batch block
-    max_frames = max([f.shape[0] for f in batch_frames])
-    window_size = batch_frames[0].shape[1]
-    
-    # Initialize padded target matrices hosted cleanly in CPU RAM
-    padded_frames = torch.zeros(len(batch), max_frames, window_size)
-    padded_labels = torch.full((len(batch), max_frames), -1.0) 
-    
-    for i, (f, l) in enumerate(zip(batch_frames, batch_labels)):
-        num_f = f.shape[0]
-        padded_frames[i, :num_f, :] = f
-        padded_labels[i, :num_f] = l
+    if not os.path.exists(protocol_path):
+        raise FileNotFoundError(f"Protocol file not found: {protocol_path}")
+    if not os.path.exists(audio_dir):
+        raise FileNotFoundError(f"Audio directory not found: {audio_dir}")
         
-    return padded_frames, padded_labels
+    with open(protocol_path, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            
+            file_id = parts[1]
+            label_str = parts[4]
+            
+            # Support both .flac and .wav extensions
+            flac_path = os.path.join(audio_dir, f"{file_id}.flac")
+            wav_path = os.path.join(audio_dir, f"{file_id}.wav")
+            
+            if os.path.exists(flac_path):
+                file_path = flac_path
+            elif os.path.exists(wav_path):
+                file_path = wav_path
+            else:
+                continue
+                
+            if label_str == "bonafide":
+                labels.append(0.0)
+                audio_paths.append(file_path)
+            elif label_str == "spoof":
+                labels.append(1.0)
+                audio_paths.append(file_path)
+                
+    return audio_paths, labels
