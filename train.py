@@ -1,200 +1,162 @@
 import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
-from dataset import SpoofDiarizationDataset, collate_diarization_batch
-from model import Wav2Vec2AASIST_Diarizer
-from metrics import compute_frame_eer, compute_spoof_jaccard_error_rate, compute_accuracy
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
+from dataset import SpoofDataset, parse_asvspoof_protocol
+from model import DualSSL_AASIST
+from metrics import compute_eer, compute_accuracy, compute_macro_f1
 
-    def forward(self, logits, targets):
-        probs = torch.sigmoid(logits)
-        bce_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        alpha_factor = targets * self.alpha + (1 - targets) * (1 - self.alpha)
-        modulating_factor = (1.0 - p_t) ** self.gamma
-        focal_loss = alpha_factor * modulating_factor * bce_loss
-        return focal_loss.mean()
 
-def train_diarizer(train_paths, train_labels, val_paths=None, val_labels=None, 
-                    batch_size=4, accumulation_steps=4, epochs=15, lr=1e-5, checkpoint_path=None, patience=3):
+def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device):
+    model.train()
+    total_loss = 0.0
+    valid_batches = 0
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Executing training pipeline on: {device}")
-    
-    train_dataset = SpoofDiarizationDataset(train_paths, train_labels)
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, 
-        num_workers=4, pin_memory=True, prefetch_factor=2,
-        collate_fn=collate_diarization_batch
-    )
-    
-    val_loader = None
-    if val_paths and val_labels:
-        val_dataset = SpoofDiarizationDataset(val_paths, val_labels)
-        val_loader = DataLoader(
-            val_dataset, batch_size=batch_size, shuffle=False, 
-            num_workers=4, pin_memory=True, collate_fn=collate_diarization_batch
-        )
-    
-    model = Wav2Vec2AASIST_Diarizer().to(device)
-    
-    # Use Focal Loss for class imbalance
-    criterion = FocalLoss(alpha=0.25, gamma=2.0)
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=1e-4)
-    scaler = torch.amp.GradScaler('cuda')
-    
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=3, T_mult=2, eta_min=1e-7
-    )
-    
-    start_epoch, best_val_loss, patience_counter = 0, float('inf'), 0
-    
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"Found existing checkpoint. Recovering states from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        print(f"Resumed successfully. Continuing from Epoch {start_epoch + 1}")
-
-    for epoch in range(start_epoch, epochs):
-        model.train()
-        epoch_loss, epoch_acc, epoch_eer, epoch_jer = 0.0, 0.0, 0.0, 0.0
-        
-        print(f"\nEpoch {epoch+1}/{epochs} (Current LR: {optimizer.param_groups[0]['lr']:.2e})")
-        
-        pbar = tqdm(train_loader, desc="Training", leave=False, dynamic_ncols=True)
+    pbar = tqdm(dataloader, desc="Training", dynamic_ncols=True)
+    for waveforms, labels in pbar:
+        waveforms = waveforms.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         
         optimizer.zero_grad()
         
-        for batch_idx, (frames, batch_labels) in enumerate(pbar):
-            frames = frames.to(device, non_blocking=True)
-            batch_labels = batch_labels.to(device, non_blocking=True).float()
+        with torch.amp.autocast('cuda'):
+            logits = model(waveforms)
+            loss = criterion(logits, labels)
+            
+        # Numerical Safety Guard against AMP float16 overflow
+        if torch.isnan(loss) or torch.isinf(loss):
+            scaler.update() # Skip step to clear scaler state
+            continue
+            
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        scaler.step(optimizer)
+        scaler.update()
+        
+        total_loss += loss.item()
+        valid_batches += 1
+        pbar.set_postfix(Loss=f"{loss.item():.4f}")
+        
+    return total_loss / max(1, valid_batches)
+
+
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    all_labels = []
+    all_scores = []
+    
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc="Validating", dynamic_ncols=True)
+        for waveforms, labels in pbar:
+            waveforms = waveforms.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             
             with torch.amp.autocast('cuda'):
-                logits = model(frames)
-                valid_mask = batch_labels != -1
-                if valid_mask.sum() == 0:
-                    continue
-                loss = criterion(logits[valid_mask], batch_labels[valid_mask]) / accumulation_steps
+                logits = model(waveforms)
+                loss = criterion(logits, labels)
+                
+            probs = torch.sigmoid(logits)
+            # Replace any stray NaNs with 0.5 to prevent evaluation crashes
+            probs = torch.nan_to_num(probs, nan=0.5).cpu().numpy()
             
-            scaler.scale(loss).backward()
+            if not torch.isnan(loss) and not torch.isinf(loss):
+                total_loss += loss.item()
+                
+            all_labels.extend(labels.cpu().numpy())
+            all_scores.extend(probs)
             
-            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-            
-            preds_float = torch.sigmoid(logits.detach().float())
-            loss_val = loss.item() * accumulation_steps
-            
-            acc = compute_accuracy(preds_float, batch_labels)
-            eer = compute_frame_eer(preds_float, batch_labels)
-            jer = compute_spoof_jaccard_error_rate(preds_float, batch_labels)
-            
-            epoch_loss += loss_val
-            epoch_acc += acc
-            epoch_eer += eer
-            epoch_jer += jer
-            
-            pbar.set_postfix(Loss=f"{loss_val:.3f}", Acc=f"{acc*100:.1f}%", EER=f"{eer:.3f}")
+    avg_loss = total_loss / len(dataloader)
+    eer, opt_thresh = compute_eer(all_labels, all_scores)
+    acc = compute_accuracy(all_labels, all_scores, threshold=opt_thresh)
+    macro_f1 = compute_macro_f1(all_labels, all_scores, threshold=opt_thresh)
+    
+    return avg_loss, eer, acc, macro_f1, opt_thresh
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"--- Launching STABILIZED DUAL-SSL Training on device: {device} ---")
+    
+    base_dir = "/home/guest/Desktop/DeepFake_Dataset/ALL Deepfake Data/AsvSpoof2019_LA/LA"
+    train_dir = os.path.join(base_dir, "ASVspoof2019_LA_train/flac")
+    train_proto = os.path.join(base_dir, "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trn.txt")
+    
+    dev_dir = os.path.join(base_dir, "ASVspoof2019_LA_dev/flac")
+    dev_proto = os.path.join(base_dir, "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.dev.trl.txt")
+    
+    print("Parsing dataset protocols...")
+    train_paths, train_labels = parse_asvspoof_protocol(train_proto, train_dir)
+    dev_paths, dev_labels = parse_asvspoof_protocol(dev_proto, dev_dir)
+    print(f"Dataset successfully loaded: {len(train_paths)} Train samples | {len(dev_paths)} Dev samples.")
+    
+    train_dataset = SpoofDataset(train_paths, train_labels)
+    dev_dataset = SpoofDataset(dev_paths, dev_labels)
+    
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4, pin_memory=True)
+    dev_loader = DataLoader(dev_dataset, batch_size=8, shuffle=False, num_workers=4, pin_memory=True)
+    
+    model = DualSSL_AASIST(w2v2_path="facebook/wav2vec2-base", wavlm_path="microsoft/wavlm-base-plus").to(device)
+    
+    # Phase 1: Freeze both backbones
+    print("\n--- STAGE 1: Training Cross-Attention & Classification Head ---")
+    for param in model.wav2vec2.parameters():
+        param.requires_grad = False
+    for param in model.wavlm.parameters():
+        param.requires_grad = False
         
-        pbar.close()
+    # FIX: Reduced learning rate from 1e-3 to 1e-4 for attention stability
+    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-4)
+    criterion = nn.BCEWithLogitsLoss()
+    scaler = torch.amp.GradScaler('cuda')
+    
+    stage1_epochs = 3
+    for epoch in range(stage1_epochs):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device)
+        val_loss, eer, acc, macro_f1, thresh = evaluate(model, dev_loader, criterion, device)
+        print(f"Stage 1 Epoch {epoch+1}/{stage1_epochs} -> Train Loss: {train_loss:.4f} | Dev Loss: {val_loss:.4f} | Dev EER: {eer*100:.2f}% | Dev Acc: {acc*100:.2f}%")
         
-        batches = len(train_loader)
-        print(f"Train Summary -> Loss: {epoch_loss/batches:.4f} | Acc: {(epoch_acc/batches)*100:.2f}% | EER: {epoch_eer/batches:.4f} | JER: {epoch_jer/batches:.4f}")
+    # Phase 2: Unfreeze top 4 transformer layers of both backbones
+    print("\n--- STAGE 2: Fine-Tuning Dual Encoder Top Layers ---")
+    for param in model.wav2vec2.encoder.layers[-4:].parameters():
+        param.requires_grad = True
+    for param in model.wavlm.encoder.layers[-4:].parameters():
+        param.requires_grad = True
         
-        current_val_loss = epoch_loss / batches
-        if val_loader:
-            model.eval()
-            val_loss, val_acc, val_eer, val_jer = 0.0, 0.0, 0.0, 0.0
-            with torch.no_grad():
-                val_pbar = tqdm(val_loader, desc="Validating", leave=False, dynamic_ncols=True)
-                for frames, batch_labels in val_pbar:
-                    frames = frames.to(device, non_blocking=True)
-                    batch_labels = batch_labels.to(device, non_blocking=True).float()
-                    with torch.amp.autocast('cuda'):
-                        logits = model(frames)
-                        valid_mask = batch_labels != -1
-                        if valid_mask.sum() == 0:
-                            continue
-                        v_loss = criterion(logits[valid_mask], batch_labels[valid_mask]).item()
-                        preds_float = torch.sigmoid(logits.detach().float())
-                        v_acc = compute_accuracy(preds_float, batch_labels)
-                        v_eer = compute_frame_eer(preds_float, batch_labels)
-                        v_jer = compute_spoof_jaccard_error_rate(preds_float, batch_labels)
-                        val_loss += v_loss
-                        val_acc += v_acc
-                        val_eer += v_eer
-                        val_jer += v_jer
-                val_pbar.close()
-            v_batches = len(val_loader)
-            current_val_loss = val_loss / v_batches
-            print(f"Val Summary   -> Loss: {current_val_loss:.4f} | Acc: {(val_acc/v_batches)*100:.2f}% | EER: {val_eer/v_batches:.4f} | JER: {val_jer/v_batches:.4f}")
-            
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total active trainable parameters for Stage 2: {trainable_params:,}")
+    
+    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-5, weight_decay=1e-4)
+    stage2_epochs = 10
+    scheduler = CosineAnnealingLR(optimizer, T_max=stage2_epochs, eta_min=1e-7)
+    
+    best_dev_eer = float('inf')
+    best_checkpoint_path = "dual_ssl_aasist_best.pt"
+    
+    for epoch in range(stage2_epochs):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device)
+        val_loss, eer, acc, macro_f1, thresh = evaluate(model, dev_loader, criterion, device)
         scheduler.step()
         
-        if current_val_loss < best_val_loss:
-            best_val_loss = current_val_loss
-            patience_counter = 0
-            checkpoint_meta = {'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'scaler_state_dict': scaler.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'best_val_loss': best_val_loss}
-            torch.save(checkpoint_meta, "w2v2_aasist_diarizer_best.pt")
-            print("Successfully saved new optimal structural checkpoint.")
-        else:
-            patience_counter += 1
-            print(f"Early Stopping Alert: Validation metrics stagnated. Count: {patience_counter}/{patience}")
-            
-        if patience_counter >= patience:
-            print(f"Early Stopping criteria triggered. Terminating pipeline execution loop at Epoch {epoch+1}.")
-            break
+        print(f"Stage 2 Epoch {epoch+1}/{stage2_epochs} -> Train Loss: {train_loss:.4f} | Dev Loss: {val_loss:.4f} | Dev EER: {eer*100:.2f}% | Dev F1: {macro_f1:.4f} | Thresh: {thresh:.4f}")
+        
+        if eer < best_dev_eer:
+            best_dev_eer = eer
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_dev_eer': best_dev_eer,
+                'optimal_threshold': thresh
+            }, best_checkpoint_path)
+            print(f"Successfully saved new optimal Dual-SSL checkpoint (Lowest Dev EER: {best_dev_eer*100:.2f}%).")
+
 
 if __name__ == "__main__":
-    base_dir = "/home/guest/Desktop/DeepFake_Dataset/ALL Deepfake Data/AsvSpoof2019_LA/LA"
-    train_flac_dir = os.path.join(base_dir, "ASVspoof2019_LA_train/flac")
-    train_protocol = os.path.join(base_dir, "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trn.txt")
-    val_flac_dir = os.path.join(base_dir, "ASVspoof2019_LA_dev/flac")
-    val_protocol = os.path.join(base_dir, "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.dev.trl.txt")
-    
-    def parse_asvspoof_protocol(protocol_path, flac_dir):
-        audio_paths, labels = [], []
-        with open(protocol_path, "r") as f:
-            lines = f.readlines()
-        for line in lines:
-            parts = line.strip().split()
-            if len(parts) < 5: continue
-            file_id = parts[1]
-            label_str = parts[4]
-            file_path = os.path.join(flac_dir, f"{file_id}.flac")
-            if not os.path.exists(file_path): continue
-            labels.append(torch.tensor([0.0]) if label_str == "bonafide" else torch.tensor([1.0]))
-            audio_paths.append(file_path)
-        return audio_paths, labels
-
-    print("--- Initializing Data Pipelines ---")
-    train_paths, train_labels = parse_asvspoof_protocol(train_protocol, train_flac_dir)
-    val_paths, val_labels = parse_asvspoof_protocol(val_protocol, val_flac_dir)
-    
-    train_diarizer(
-        train_paths=train_paths, 
-        train_labels=train_labels,
-        val_paths=val_paths,    
-        val_labels=val_labels,
-        batch_size=4,             
-        accumulation_steps=4,     
-        epochs=15,          
-        checkpoint_path="w2v2_aasist_diarizer_best.pt", 
-        patience=3                
-    )
+    main()
