@@ -1,0 +1,10 @@
+Dataset Name,Direct Download Link
+In-the-Wild Audio Deepfake,[https://www.kaggle.com/datasets/abdallamohamed312/in-the-wild-dataset](https://www.kaggle.com/datasets/abdallamohamed312/in-the-wild-dataset)
+LAV-DF,[https://github.com/ControlNet/LAV-DF](https://github.com/ControlNet/LAV-DF)
+ADD 2022 (Train & Dev),[https://zenodo.org/records/12188127](https://zenodo.org/records/12188127)
+ADD 2022 (Adaptation),[https://zenodo.org/records/12188083](https://zenodo.org/records/12188083)
+ADD 2022 (Track 3 Partial Fake),[https://zenodo.org/records/12188035](https://zenodo.org/records/12188035)
+ADD 2023 (Track 2),[https://zenodo.org/records/12176530](https://zenodo.org/records/12176530)
+ASVspoof 2021 (Deepfake Track),[https://www.kaggle.com/datasets/mohammedabdeldayem/avsspoof-2021](https://www.kaggle.com/datasets/mohammedabdeldayem/avsspoof-2021)
+PartialSpoof Database,[https://zenodo.org/records/5112031](https://zenodo.org/records/5112031)
+MUSAN (Background Noise),[http://www.openslr.org/17/](http://www.openslr.org/17/)
